@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project name="buildingdetector" default="dist" basedir=".">
+    <property name="plugin.main.version" value="16643"/>
+    <property name="plugin.author" value="OSM Building Detector"/>
+    <property name="plugin.class" value="org.openstreetmap.josm.plugins.buildingdetector.BuildingDetectorPlugin"/>
+    <property name="plugin.description" value="Automatische Gebäudeerkennung aus Luftbildern mit Kontrasterkennung"/>
+    <property name="plugin.early" value="false"/>
+    <property name="plugin.icon" value="images/building_detector.png"/>
+    <property name="plugin.link" value="https://wiki.openstreetmap.org/wiki/JOSM/Plugins/BuildingDetector"/>
+
+    <property name="src.dir" location="src"/>
+    <property name="lib.dir" location="lib"/>
+    <property name="plugin.dist.dir" value="${basedir}/dist"/>
+    <property name="plugin.build.dir" value="${basedir}/build"/>
+    <property name="plugin.jar" value="${plugin.dist.dir}/${ant.project.name}.jar"/>
+
+    <target name="init">
+        <mkdir dir="${plugin.build.dir}"/>
+        <mkdir dir="${plugin.dist.dir}"/>
+    </target>
+
+    <target name="compile" depends="init">
+        <echo message="compiling sources for ${plugin.jar} ..."/>
+        <javac srcdir="${src.dir}" destdir="${plugin.build.dir}" release="21" debug="true" includeantruntime="false" encoding="UTF-8">
+            <classpath>
+                <pathelement location="${plugin.build.dir}"/>
+                <fileset dir="${lib.dir}">
+                    <include name="**/*.jar"/>
+                </fileset>
+            </classpath>
+            <compilerarg value="-Xlint:deprecation"/>
+            <compilerarg value="-Xlint:unchecked"/>
+        </javac>
+    </target>
+
+    <target name="dist" depends="compile,revision">
+        <echo message="creating ${plugin.jar} ..."/>
+        <jar destfile="${plugin.jar}" basedir="${plugin.build.dir}">
+            <manifest>
+                <attribute name="Author" value="${plugin.author}"/>
+                <attribute name="Plugin-Class" value="${plugin.class}"/>
+                <attribute name="Plugin-Date" value="${version.entry.commit.date}"/>
+                <attribute name="Plugin-Description" value="${plugin.description}"/>
+                <attribute name="Plugin-Early" value="${plugin.early}"/>
+                <attribute name="Plugin-Icon" value="${plugin.icon}"/>
+                <attribute name="Plugin-Link" value="${plugin.link}"/>
+                <attribute name="Plugin-Mainversion" value="${plugin.main.version}"/>
+                <attribute name="Plugin-Version" value="${version.entry.commit.revision}"/>
+            </manifest>
+        </jar>
+    </target>
+
+    <target name="revision">
+        <echo message="Skipping SVN revision check, using placeholder values."/>
+        <tstamp>
+            <format property="version.entry.commit.date" pattern="yyyy-MM-dd'T'HH:mm:ss'Z'"/>
+        </tstamp>
+        <property name="version.entry.commit.revision" value="local-build"/>
+    </target>
+
+    <target name="clean">
+        <delete dir="${plugin.build.dir}"/>
+        <delete dir="${plugin.dist.dir}"/>
+    </target>
+
+    <target name="install" depends="dist">
+        <property environment="env"/>
+        <copy file="${plugin.jar}" todir="${env.APPDATA}/JOSM/plugins" failonerror="false"/>
+    </target>
+</project>

@@ -1,0 +1,320 @@
+package org.openstreetmap.josm.plugins.buildingdetector;
+
+import java.awt.Polygon;
+import java.awt.Rectangle;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import org.openstreetmap.josm.plugins.buildingdetector.ImageProcessor.Point;
+
+/**
+ * Repräsentiert eine geodätisch und fernerkundlich ausgewertete Gebäudekontur.
+ * Speichert sowohl die rohen Randpunkte als auch die orthogonalisierten Eckpunkte,
+ * die Hauptorientierung (Azimut), Schattenwurf-Indikatoren und Nachbarschafts-Scores.
+ */
+public class BuildingContour {
+
+    private List<Point> corners;
+    private List<Point> rawBoundaryPoints;
+    private double dominantAngleRad; // Hauptorientierung im Bogenmaß [-pi/2, pi/2]
+    private double rectangularity;   // Verhältnis wahre Fläche zu OMBB-Fläche [0..1]
+    private double shadowScore;      // 3D-Schattenwurf-Evidenz [0..1]
+    private double edgeStrength;     // Mittlere Kantenstärke entlang der Kontur [0..1]
+    private double neighborhoodScore;// Nachbarschafts- & Fluchtkonsens [0..1]
+    private double confidenceScore;  // Gesamtkonfidenz [0..1]
+
+    /**
+     * Konstruktor für eine erkannte Gebäudekontur.
+     *
+     * @param corners Geordnete Liste der Eckpunkte (ideal: 4 Punkte der OMBB oder L-Polygon)
+     */
+    public BuildingContour(List<Point> corners) {
+        this(corners, corners, 0.0, 1.0);
+    }
+
+    public BuildingContour(List<Point> corners, List<Point> rawBoundaryPoints, double dominantAngleRad, double rectangularity) {
+        this.corners = new ArrayList<>(corners);
+        this.rawBoundaryPoints = rawBoundaryPoints != null ? new ArrayList<>(rawBoundaryPoints) : new ArrayList<>(corners);
+        this.dominantAngleRad = normalizeAngleHalfPi(dominantAngleRad);
+        this.rectangularity = Math.max(0.0, Math.min(1.0, rectangularity));
+        this.shadowScore = 0.0;
+        this.edgeStrength = 0.5;
+        this.neighborhoodScore = 0.5;
+        this.confidenceScore = 0.5;
+    }
+
+    public List<Point> getCorners() {
+        return Collections.unmodifiableList(corners);
+    }
+
+    public void setCorners(List<Point> corners) {
+        this.corners = new ArrayList<>(corners);
+    }
+
+    public List<Point> getRawBoundaryPoints() {
+        return Collections.unmodifiableList(rawBoundaryPoints);
+    }
+
+    /**
+     * Berechnet die exakte Polygonfläche mittels Gaußscher Trapezformel (Shoelace-Formel).
+     *
+     * @return Fläche in Quadratpixeln
+     */
+    public double getExactArea() {
+        if (corners == null || corners.size() < 3) {
+            return 0.0;
+        }
+        double sum = 0.0;
+        int n = corners.size();
+        for (int i = 0; i < n; i++) {
+            Point p1 = corners.get(i);
+            Point p2 = corners.get((i + 1) % n);
+            sum += (double) p1.x * p2.y - (double) p2.x * p1.y;
+        }
+        return Math.abs(sum) * 0.5;
+    }
+
+    /**
+     * Gibt die gerundete Polygonfläche in Quadratpixeln zurück (Abwärtskompatibilität).
+     *
+     * @return Fläche in Quadratpixeln
+     */
+    public int getArea() {
+        return (int) Math.round(getExactArea());
+    }
+
+    /**
+     * Berechnet den Umfang der Gebäudekontur.
+     *
+     * @return Umfang in Pixeln
+     */
+    public double getPerimeter() {
+        if (corners == null || corners.size() < 2) {
+            return 0.0;
+        }
+        double perimeter = 0.0;
+        int n = corners.size();
+        for (int i = 0; i < n; i++) {
+            Point current = corners.get(i);
+            Point next = corners.get((i + 1) % n);
+            perimeter += Math.hypot(next.x - current.x, next.y - current.y);
+        }
+        return perimeter;
+    }
+
+    /**
+     * Berechnet den geometrischen Schwerpunkt (Centroid) der Kontur.
+     *
+     * @return Schwerpunkt als Point
+     */
+    public Point getCenter() {
+        if (corners == null || corners.isEmpty()) {
+            return new Point(0, 0);
+        }
+        double sumX = 0;
+        double sumY = 0;
+        for (Point corner : corners) {
+            sumX += corner.x;
+            sumY += corner.y;
+        }
+        return new Point((int) Math.round(sumX / corners.size()), (int) Math.round(sumY / corners.size()));
+    }
+
+    /**
+     * Berechnet das Seitenverhältnis (Länge zu Breite) unabhängig von der Drehung.
+     *
+     * @return Seitenverhältnis >= 1.0
+     */
+    public double getAspectRatio() {
+        if (corners == null || corners.size() < 4) {
+            return 1.0;
+        }
+        double d1 = Math.hypot(corners.get(1).x - corners.get(0).x, corners.get(1).y - corners.get(0).y);
+        double d2 = Math.hypot(corners.get(2).x - corners.get(1).x, corners.get(2).y - corners.get(1).y);
+        double minSide = Math.max(1.0, Math.min(d1, d2));
+        double maxSide = Math.max(d1, d2);
+        return maxSide / minSide;
+    }
+
+    /**
+     * Prüft die echte Rechtwinkligkeit der Kontur anhand der Innenwinkel (Skalarprodukt)
+     * und des Seitenverhältnisses.
+     *
+     * @return True, wenn alle Innenwinkel nahe 90° liegen und das Seitenverhältnis plausibel ist
+     */
+    public boolean isRectangular() {
+        if (corners == null || (corners.size() != 4 && corners.size() != 6 && corners.size() != 8)) {
+            return false;
+        }
+        if (getAspectRatio() > 8.0 || rectangularity < 0.55) {
+            return false;
+        }
+
+        int n = corners.size();
+        for (int i = 0; i < n; i++) {
+            Point prev = corners.get((i - 1 + n) % n);
+            Point curr = corners.get(i);
+            Point next = corners.get((i + 1) % n);
+
+            double vx1 = prev.x - curr.x;
+            double vy1 = prev.y - curr.y;
+            double vx2 = next.x - curr.x;
+            double vy2 = next.y - curr.y;
+
+            double len1 = Math.hypot(vx1, vy1);
+            double len2 = Math.hypot(vx2, vy2);
+            if (len1 < 1e-3 || len2 < 1e-3) {
+                return false;
+            }
+
+            // Kosinus des eingeschlossenen Winkels (bei 90° ist cos = 0)
+            double cosTheta = Math.abs((vx1 * vx2 + vy1 * vy2) / (len1 * len2));
+            if (cosTheta > 0.22) { // Erlaubt ca. +/- 12.5° Abweichung vor finaler Orthogonalisierung
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Rotiert die Eckpunkte der Kontur um ihren Schwerpunkt auf einen neuen Zielwinkel,
+     * z. B. zur Ausrichtung an der dominanten Gebäudeflucht der Nachbarschaft.
+     *
+     * @param newAngleRad Neuer Hauptwinkel im Bogenmaß
+     */
+    public void alignToAngle(double newAngleRad) {
+        double delta = normalizeAnglePiOver2(newAngleRad - this.dominantAngleRad);
+        if (Math.abs(delta) < 1e-4 || corners.isEmpty()) {
+            return;
+        }
+        Point center = getCenter();
+        double cos = Math.cos(delta);
+        double sin = Math.sin(delta);
+
+        List<Point> rotated = new ArrayList<>(corners.size());
+        for (Point p : corners) {
+            double dx = p.x - center.x;
+            double dy = p.y - center.y;
+            int rx = (int) Math.round(center.x + dx * cos - dy * sin);
+            int ry = (int) Math.round(center.y + dx * sin + dy * cos);
+            rotated.add(new Point(rx, ry));
+        }
+        this.corners = rotated;
+        this.dominantAngleRad = normalizeAngleHalfPi(newAngleRad);
+    }
+
+    /**
+     * Berechnet die Schnittfläche über Vereinigungsfläche (IoU) der Bounding-Boxen
+     * bzw. prüft auf starke räumliche Überlappung zweier Gebäudekonturen.
+     */
+    public double computeOverlapRatio(BuildingContour other) {
+        Rectangle r1 = this.getBoundingBox();
+        Rectangle r2 = other.getBoundingBox();
+        if (!r1.intersects(r2)) {
+            return 0.0;
+        }
+        Rectangle inter = r1.intersection(r2);
+        double interArea = (double) inter.width * inter.height;
+        double minArea = Math.max(1.0, Math.min(this.getExactArea(), other.getExactArea()));
+        return interArea / minArea;
+    }
+
+    public Polygon toAwtPolygon() {
+        Polygon poly = new Polygon();
+        for (Point p : corners) {
+            poly.addPoint(p.x, p.y);
+        }
+        return poly;
+    }
+
+    public Rectangle getBoundingBox() {
+        if (corners == null || corners.isEmpty()) {
+            return new Rectangle(0, 0, 0, 0);
+        }
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+        for (Point corner : corners) {
+            minX = Math.min(minX, corner.x);
+            maxX = Math.max(maxX, corner.x);
+            minY = Math.min(minY, corner.y);
+            maxY = Math.max(maxY, corner.y);
+        }
+        return new Rectangle(minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY));
+    }
+
+    /**
+     * Normalisiert einen Winkel in das Intervall [-pi/4, pi/4] für 90°-symmetrische Rechtecke.
+     */
+    public static double normalizeAnglePiOver2(double angle) {
+        double halfPi = Math.PI / 2.0;
+        double a = angle % halfPi;
+        if (a > Math.PI / 4.0) {
+            a -= halfPi;
+        } else if (a < -Math.PI / 4.0) {
+            a += halfPi;
+        }
+        return a;
+    }
+
+    public static double normalizeAngleHalfPi(double angle) {
+        double a = angle % Math.PI;
+        if (a > Math.PI / 2.0) {
+            a -= Math.PI;
+        } else if (a < -Math.PI / 2.0) {
+            a += Math.PI;
+        }
+        return a;
+    }
+
+    public double getDominantAngleRad() {
+        return dominantAngleRad;
+    }
+
+    public void setDominantAngleRad(double dominantAngleRad) {
+        this.dominantAngleRad = normalizeAngleHalfPi(dominantAngleRad);
+    }
+
+    public double getRectangularity() {
+        return rectangularity;
+    }
+
+    public double getShadowScore() {
+        return shadowScore;
+    }
+
+    public void setShadowScore(double shadowScore) {
+        this.shadowScore = Math.max(0.0, Math.min(1.0, shadowScore));
+    }
+
+    public double getEdgeStrength() {
+        return edgeStrength;
+    }
+
+    public void setEdgeStrength(double edgeStrength) {
+        this.edgeStrength = Math.max(0.0, Math.min(1.0, edgeStrength));
+    }
+
+    public double getNeighborhoodScore() {
+        return neighborhoodScore;
+    }
+
+    public void setNeighborhoodScore(double neighborhoodScore) {
+        this.neighborhoodScore = Math.max(0.0, Math.min(1.0, neighborhoodScore));
+    }
+
+    public double getConfidenceScore() {
+        return confidenceScore;
+    }
+
+    public void setConfidenceScore(double confidenceScore) {
+        this.confidenceScore = Math.max(0.0, Math.min(1.0, confidenceScore));
+    }
+
+    @Override
+    public String toString() {
+        return String.format(
+            "BuildingContour{area=%d px², corners=%d, angle=%.1f°, shadow=%.2f, neighbor=%.2f, conf=%.2f}",
+            getArea(), corners.size(), Math.toDegrees(dominantAngleRad), shadowScore, neighborhoodScore, confidenceScore
+        );
+    }
+}
